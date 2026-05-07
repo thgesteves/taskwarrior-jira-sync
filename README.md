@@ -156,7 +156,7 @@ The hook starts the transition asynchronously and does not wait for Jira or netw
 Transition mode calls:
 
 ```sh
-acli jira workitem transition --key SWAT-2824 --transition "In Review"
+acli jira workitem transition --key SWAT-2824 --status "In Review" --yes
 ```
 
 There is no retry queue. Errors are logged.

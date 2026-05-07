@@ -91,8 +91,9 @@ class TaskwarriorJiraSyncTests(unittest.TestCase):
                 "transition",
                 "--key",
                 "SWAT-2824",
-                "--transition",
+                "--status",
                 "In Review",
+                "--yes",
             ],
         )
 

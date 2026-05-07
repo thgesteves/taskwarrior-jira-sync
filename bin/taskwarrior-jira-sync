@@ -245,8 +245,9 @@ def build_transition_command(jira_id, status):
         "transition",
         "--key",
         jira_id,
-        "--transition",
+        "--status",
         status,
+        "--yes",
     ]
 
 
