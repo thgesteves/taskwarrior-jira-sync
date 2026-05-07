@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""
+Small Jira <-> Taskwarrior sync.
+
+Taskwarrior stays the source of truth. This script reads through `task export`
+and writes through the native `task` command.
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+JQL_ASSIGNED_NOT_DONE = "assignee = currentUser() AND statusCategory != Done"
+DEFAULT_PROJECT = "work"
+DEFAULT_LOG = Path.home() / ".taskwarrior-jira-sync.log"
+LOGGER_NAME = "taskwarrior_jira_sync"
+_LOGGER_PATH = None
+_LOGGER_DEBUG = False
+
+UDA_LINES = [
+    "uda.source.type=string",
+    "uda.source.label=Source",
+    "uda.jira_id.type=string",
+    "uda.jira_id.label=Jira ID",
+    "uda.jira_url.type=string",
+    "uda.jira_url.label=Jira URL",
+    "uda.jira_status.type=string",
+    "uda.jira_status.label=Jira Status",
+]
+
+
+def env_project():
+    return os.environ.get("TASKW_JIRA_PROJECT", DEFAULT_PROJECT)
+
+
+def log_path():
+    return Path(os.environ.get("TASKW_JIRA_LOG", str(DEFAULT_LOG))).expanduser()
+
+
+def configure_logging(debug_enabled=False):
+    global _LOGGER_PATH, _LOGGER_DEBUG
+
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.propagate = False
+
+    if debug_enabled:
+        _LOGGER_DEBUG = True
+
+    if _LOGGER_PATH != path:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(handler)
+        _LOGGER_PATH = path
+
+    logger.setLevel(logging.DEBUG if _LOGGER_DEBUG else logging.INFO)
+    return logger
+
+
+def log(level, message):
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    configure_logging().log(numeric_level, message)
+
+
+def debug(enabled, message):
+    if enabled:
+        configure_logging(True).debug(message)
+
+
+def quote_command(cmd):
+    return " ".join(_quote_part(part) for part in cmd)
+
+
+def _quote_part(part):
+    part = str(part)
+    if not part:
+        return "''"
+    if re.search(r"[\s'\"\\$`!*?[\]{}()<>|&;]", part):
+        return "'" + part.replace("'", "'\\''") + "'"
+    return part
+
+
+def run_cmd(cmd, debug_enabled=False):
+    debug(debug_enabled, f"call: {quote_command(cmd)}")
+    return subprocess.run(cmd, check=False, text=True, capture_output=True)
+
+
+def load_taskwarrior_tasks(debug_enabled=False):
+    result = run_cmd(["task", "export"], debug_enabled)
+    if result.returncode != 0:
+        raise RuntimeError(f"task export failed: {result.stderr.strip() or result.stdout.strip()}")
+    if not result.stdout.strip():
+        return []
+    return json.loads(result.stdout)
+
+
+def fetch_jira_issues(debug_enabled=False):
+    cmd = [
+        "acli",
+        "jira",
+        "workitem",
+        "search",
+        "--jql",
+        JQL_ASSIGNED_NOT_DONE,
+        "--json",
+    ]
+    result = run_cmd(cmd, debug_enabled)
+    if result.returncode != 0:
+        raise RuntimeError(f"acli jira search failed: {result.stderr.strip() or result.stdout.strip()}")
+    if not result.stdout.strip():
+        return []
+    return parse_issues(json.loads(result.stdout))
+
+
+def parse_issues(raw):
+    if isinstance(raw, list):
+        return [_issue_from_dict(item) for item in raw if isinstance(item, dict)]
+    if isinstance(raw, dict):
+        for key in ("issues", "items", "results", "workItems", "workitems"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return parse_issues(value)
+        return [_issue_from_dict(raw)]
+    return []
+
+
+def _issue_from_dict(data):
+    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
+    status = _status_name(data.get("status")) or _status_name(fields.get("status"))
+    return {
+        "id": _first(data, "key", "issueKey", "issue_key", "jira_id", "id"),
+        "summary": _first(data, "summary", "title") or _first(fields, "summary", "title"),
+        "url": _first(data, "url", "webUrl", "web_url", "browseUrl", "browse_url", "jira_url", "self"),
+        "status": status,
+    }
+
+
+def _first(data, *keys):
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _status_name(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return _first(value, "name", "status", "value")
+    return ""
+
+
+def has_jira_task(tasks, jira_id):
+    return any(str(task.get("jira_id", "")).strip() == jira_id for task in tasks)
+
+
+def build_task_add_command(project, issue):
+    args = [
+        "task",
+        "add",
+        f"project:{project}",
+        "source:jira",
+        f"jira_id:{issue['id']}",
+    ]
+    if issue.get("url"):
+        args.append(f"jira_url:{issue['url']}")
+    if issue.get("status"):
+        args.append(f"jira_status:{issue['status']}")
+    args.append(f"{issue['id']} {issue.get('summary', '')}".strip())
+    return args
+
+
+def parse_created_task_id(output):
+    match = re.search(r"created task\s+(\d+)", output, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def import_jira_tasks(debug_enabled=False):
+    project = env_project()
+    debug(debug_enabled, "start jira import")
+    debug(debug_enabled, f"project: {project}")
+
+    tasks = load_taskwarrior_tasks(debug_enabled)
+    issues = fetch_jira_issues(debug_enabled)
+    imported = 0
+    skipped = 0
+
+    for issue in issues:
+        jira_id = issue.get("id", "")
+        if not jira_id:
+            log("ERROR", f"skipping Jira issue without id: {issue}")
+            continue
+        debug(debug_enabled, f"issue: {jira_id} status={issue.get('status', '')}")
+        if has_jira_task(tasks, jira_id):
+            skipped += 1
+            continue
+
+        cmd = build_task_add_command(project, issue)
+        result = run_cmd(cmd, debug_enabled)
+        if result.returncode != 0:
+            log("ERROR", f"task add failed for {jira_id}: {result.stderr.strip() or result.stdout.strip()}")
+            continue
+        task_id = parse_created_task_id(result.stdout + result.stderr)
+        debug(debug_enabled, f"created task id for {jira_id}: {task_id or 'unknown'}")
+        tasks.append({"jira_id": jira_id})
+        imported += 1
+
+    log("INFO", f"jira import complete: imported={imported} skipped={skipped}")
+    debug(debug_enabled, "end jira import")
+    return 0
+
+
+def build_transition_command(jira_id, status):
+    return [
+        "acli",
+        "jira",
+        "workitem",
+        "transition",
+        "--key",
+        jira_id,
+        "--transition",
+        status,
+    ]
+
+
+def transition_jira(jira_id, status, task_uuid="", reason="", debug_enabled=False):
+    debug(debug_enabled, "start jira transition")
+    debug(debug_enabled, f"transition: jira_id={jira_id} status={status} task_uuid={task_uuid} reason={reason}")
+    result = run_cmd(build_transition_command(jira_id, status), debug_enabled)
+    if result.returncode != 0:
+        log("ERROR", f"jira transition failed: jira_id={jira_id} status={status} task_uuid={task_uuid} reason={reason} output={result.stderr.strip() or result.stdout.strip()}")
+        return 1
+    log("INFO", f"jira transition complete: jira_id={jira_id} status={status} task_uuid={task_uuid} reason={reason}")
+    debug(debug_enabled, "end jira transition")
+    return 0
+
+
+def detect_transition(old_task, new_task):
+    if new_task.get("source") != "jira":
+        return None
+    jira_id = str(new_task.get("jira_id", "")).strip()
+    if not jira_id:
+        return None
+    task_uuid = str(new_task.get("uuid", "")).strip()
+    old_status = str(old_task.get("jira_status", "")).strip()
+    new_status = str(new_task.get("jira_status", "")).strip()
+    if new_status and old_status != new_status:
+        return {
+            "jira_id": jira_id,
+            "status": new_status,
+            "task_uuid": task_uuid,
+            "reason": "jira_status_changed",
+        }
+    return None
+
+
+def run_hook(debug_enabled=False):
+    old_raw = sys.stdin.readline().rstrip("\r\n")
+    new_raw = sys.stdin.readline().rstrip("\r\n")
+    if new_raw:
+        print(new_raw)
+    try:
+        old_task = json.loads(old_raw)
+        new_task = json.loads(new_raw)
+        event = detect_transition(old_task, new_task)
+        if event:
+            start_transition_async(event, debug_enabled)
+    except Exception as exc:
+        log("ERROR", f"hook failed: {exc}")
+    return 0
+
+
+def start_transition_async(event, debug_enabled=False):
+    script = Path(sys.argv[0])
+    if not script.exists():
+        script = Path.home() / ".local/bin/taskwarrior-jira-sync"
+    cmd = [
+        str(script),
+        "--transition",
+        "--jira-id",
+        event["jira_id"],
+        "--status",
+        event["status"],
+        "--task-uuid",
+        event["task_uuid"],
+        "--reason",
+        event["reason"],
+    ]
+    if debug_enabled:
+        cmd.append("--debug")
+    debug(debug_enabled, f"async transition: {quote_command(cmd)}")
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        log("ERROR", f"could not start async transition: {exc}")
+
+
+def append_missing_udas(existing_text):
+    existing_lines = {line.strip() for line in existing_text.splitlines()}
+    existing_keys = {_uda_key(line) for line in existing_lines if _uda_key(line)}
+    missing = [line for line in UDA_LINES if _uda_key(line) not in existing_keys]
+    if not missing:
+        return existing_text, []
+
+    output = existing_text
+    if output and not output.endswith("\n"):
+        output += "\n"
+    if output.strip():
+        output += "\n"
+    if "# taskwarrior-jira-sync UDAs" not in existing_lines:
+        output += "# taskwarrior-jira-sync UDAs\n"
+    output += "\n".join(missing) + "\n"
+    return output, missing
+
+
+def _uda_key(line):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return ""
+    key, _ = stripped.split("=", 1)
+    key = key.strip()
+    if key.startswith("uda."):
+        return key
+    return ""
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Sync assigned Jira issues into Taskwarrior and transition Jira from Taskwarrior hooks.")
+    parser.add_argument("--debug", action="store_true", help="write debug logs")
+    parser.add_argument("--hook", action="store_true", help="run as a Taskwarrior on-modify hook helper")
+    parser.add_argument("--transition", action="store_true", help="transition one Jira issue")
+    parser.add_argument("--jira-id", default="", help="Jira issue key")
+    parser.add_argument("--status", default="", help="Jira transition/status name")
+    parser.add_argument("--task-uuid", default="", help="Taskwarrior task UUID")
+    parser.add_argument("--reason", default="", help="transition reason")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.hook:
+            return run_hook(args.debug)
+        if args.transition:
+            if not args.jira_id or not args.status:
+                log("ERROR", "--transition requires --jira-id and --status")
+                return 2
+            return transition_jira(args.jira_id, args.status, args.task_uuid, args.reason, args.debug)
+        return import_jira_tasks(args.debug)
+    except Exception as exc:
+        log("ERROR", str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

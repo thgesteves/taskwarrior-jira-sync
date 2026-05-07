@@ -1,0 +1,24 @@
+#!/bin/sh
+set +e
+
+BIN="${HOME}/.local/bin/taskwarrior-jira-sync"
+LOG="${TASKW_JIRA_LOG:-${HOME}/.taskwarrior-jira-sync.log}"
+
+IFS= read -r OLD_JSON || OLD_JSON=""
+IFS= read -r NEW_JSON || NEW_JSON=""
+
+if [ -x "$BIN" ]; then
+	OUTPUT=$(printf '%s\n%s\n' "$OLD_JSON" "$NEW_JSON" | "$BIN" --hook 2>>"$LOG")
+	STATUS=$?
+	if [ "$STATUS" -eq 0 ] && [ -n "$OUTPUT" ]; then
+		printf '%s\n' "$OUTPUT"
+		exit 0
+	fi
+	printf '%s ERROR hook helper failed status=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$STATUS" >>"$LOG"
+else
+	printf '%s ERROR missing hook helper: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$BIN" >>"$LOG"
+fi
+
+printf '%s\n' "$NEW_JSON"
+exit 0
+
