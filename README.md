@@ -90,10 +90,17 @@ Configuration is intentionally minimal.
 
 ```sh
 export TASKW_JIRA_PROJECT=work
+export TASKW_JIRA_BASE_URL=https://your-site.atlassian.net/browse
 export TASKW_JIRA_LOG=~/.taskwarrior-jira-sync.log
 ```
 
-Both variables are optional. The default project is `work`, and the default log file is `~/.taskwarrior-jira-sync.log`.
+All variables are optional. The default project is `work`, and the default log file is `~/.taskwarrior-jira-sync.log`.
+
+Set `TASKW_JIRA_BASE_URL` if the URL returned by `acli` is not browser-friendly for your Jira site. Use the issue browser URL prefix, not only the site root. The importer appends the Jira key:
+
+```text
+https://your-site.atlassian.net/browse/SWAT-2824
+```
 
 ## Import Jira Issues
 
@@ -115,7 +122,7 @@ For each issue, it skips creation if a Taskwarrior task with the same `jira_id` 
 task add project:work source:jira jira_id:<KEY> jira_url:<URL> jira_status:<STATUS> "<KEY> <summary>"
 ```
 
-If `acli` does not return a URL, `jira_url` is omitted.
+If `TASKW_JIRA_BASE_URL` is set, `jira_url` is built from that value and the Jira key. Otherwise the importer uses the URL returned by `acli`. If neither is available, `jira_url` is omitted.
 
 ## Re-import Jira Issues
 

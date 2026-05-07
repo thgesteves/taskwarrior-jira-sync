@@ -1,7 +1,9 @@
 import json
+import os
 import runpy
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "taskwarrior-jira-sync"
@@ -21,19 +23,45 @@ class TaskwarriorJiraSyncTests(unittest.TestCase):
             "url": "https://jira.example/browse/SWAT-2824",
             "status": "In Progress",
         }
-        self.assertEqual(
-            mod["build_task_add_command"]("work", issue),
-            [
-                "task",
-                "add",
-                "project:work",
-                "source:jira",
-                "jira_id:SWAT-2824",
+        with patch.dict(os.environ, {"TASKW_JIRA_BASE_URL": ""}):
+            self.assertEqual(
+                mod["build_task_add_command"]("work", issue),
+                [
+                    "task",
+                    "add",
+                    "project:work",
+                    "source:jira",
+                    "jira_id:SWAT-2824",
+                    "jira_url:https://jira.example/browse/SWAT-2824",
+                    "jira_status:In Progress",
+                    "SWAT-2824 Fix sync",
+                ],
+            )
+
+    def test_task_add_command_uses_jira_base_url_env(self):
+        issue = {
+            "id": "SWAT-2824",
+            "summary": "Fix sync",
+            "url": "https://wrong.example/SWAT-2824",
+            "status": "In Progress",
+        }
+        with patch.dict(os.environ, {"TASKW_JIRA_BASE_URL": "https://jira.example/browse"}):
+            self.assertIn(
                 "jira_url:https://jira.example/browse/SWAT-2824",
-                "jira_status:In Progress",
-                "SWAT-2824 Fix sync",
-            ],
-        )
+                mod["build_task_add_command"]("work", issue),
+            )
+
+    def test_task_add_command_trims_jira_base_url_trailing_slash(self):
+        issue = {
+            "id": "SWAT-2824",
+            "summary": "Fix sync",
+            "status": "In Progress",
+        }
+        with patch.dict(os.environ, {"TASKW_JIRA_BASE_URL": "https://jira.example/browse/"}):
+            self.assertIn(
+                "jira_url:https://jira.example/browse/SWAT-2824",
+                mod["build_task_add_command"]("work", issue),
+            )
 
     def test_detect_jira_status_change(self):
         old = {"uuid": "abc", "source": "jira", "jira_id": "SWAT-2824", "jira_status": "To Do", "status": "pending"}

@@ -39,6 +39,10 @@ def env_project():
     return os.environ.get("TASKW_JIRA_PROJECT", DEFAULT_PROJECT)
 
 
+def env_jira_base_url():
+    return os.environ.get("TASKW_JIRA_BASE_URL", "").strip().rstrip("/")
+
+
 def log_path():
     return Path(os.environ.get("TASKW_JIRA_LOG", str(DEFAULT_LOG))).expanduser()
 
@@ -168,6 +172,14 @@ def has_jira_task(tasks, jira_id):
     return any(str(task.get("jira_id", "")).strip() == jira_id for task in tasks)
 
 
+def jira_issue_url(issue):
+    jira_id = str(issue.get("id", "")).strip()
+    base_url = env_jira_base_url()
+    if base_url and jira_id:
+        return f"{base_url}/{jira_id}"
+    return str(issue.get("url", "")).strip()
+
+
 def build_task_add_command(project, issue):
     args = [
         "task",
@@ -176,8 +188,9 @@ def build_task_add_command(project, issue):
         "source:jira",
         f"jira_id:{issue['id']}",
     ]
-    if issue.get("url"):
-        args.append(f"jira_url:{issue['url']}")
+    url = jira_issue_url(issue)
+    if url:
+        args.append(f"jira_url:{url}")
     if issue.get("status"):
         args.append(f"jira_status:{issue['status']}")
     args.append(f"{issue['id']} {issue.get('summary', '')}".strip())
